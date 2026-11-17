@@ -35,6 +35,7 @@
 #include <sys/systm.h>
 #include <sys/malloc.h>
 #include <sys/kernel.h>
+#include <sys/hash.h>
 #include <sys/sysctl.h>
 #include <sys/proc.h>
 #include <sys/sglist.h>
@@ -573,9 +574,25 @@ linux_cdev_pager_populate(vm_object_t vm_obj, vm_pindex_t pidx, int fault_type,
 	return (err);
 }
 
+/*
+ * The VM area structures of mapped character devices, hashed by their
+ * handle (vm_private_data).  Each page fault on such a mapping looks its
+ * structure up here, as does each mmap, and a GPU driver may keep many
+ * thousands of buffer objects mapped at once, so a single list made each
+ * fault walk them all.
+ */
+#define	LINUX_VMA_HASH_SIZE	1024	/* a power of 2 */
+TAILQ_HEAD(linux_vma_list, vm_area_struct);
 static struct rwlock linux_vma_lock;
-static TAILQ_HEAD(, vm_area_struct) linux_vma_head =
-    TAILQ_HEAD_INITIALIZER(linux_vma_head);
+static struct linux_vma_list linux_vma_hash[LINUX_VMA_HASH_SIZE];
+
+static struct linux_vma_list *
+linux_vma_bucket(void *handle)
+{
+
+	return (&linux_vma_hash[hash32_buf(&handle, sizeof(handle),
+	    HASHINIT) & (LINUX_VMA_HASH_SIZE - 1)]);
+}
 
 static void
 linux_cdev_handle_free(struct vm_area_struct *vmap)
@@ -594,7 +611,7 @@ static void
 linux_cdev_handle_remove(struct vm_area_struct *vmap)
 {
 	rw_wlock(&linux_vma_lock);
-	TAILQ_REMOVE(&linux_vma_head, vmap, vm_entry);
+	TAILQ_REMOVE(linux_vma_bucket(vmap->vm_private_data), vmap, vm_entry);
 	rw_wunlock(&linux_vma_lock);
 }
 
@@ -604,7 +621,7 @@ linux_cdev_handle_find(void *handle)
 	struct vm_area_struct *vmap;
 
 	rw_rlock(&linux_vma_lock);
-	TAILQ_FOREACH(vmap, &linux_vma_head, vm_entry) {
+	TAILQ_FOREACH(vmap, linux_vma_bucket(handle), vm_entry) {
 		if (vmap->vm_private_data == handle)
 			break;
 	}
@@ -1343,7 +1360,7 @@ linux_file_mmap_single(struct file *fp, const struct file_operations *fop,
 	 * and the mm_struct is usually freed when a process exits.
 	 *
 	 * The atomic reference below makes sure the mm_struct is
-	 * available as long as the vmap is in the linux_vma_head.
+	 * available as long as the vmap is in the linux_vma_hash.
 	 */
 	task = current;
 	mm = task->mm;
@@ -1393,7 +1410,8 @@ linux_file_mmap_single(struct file *fp, const struct file_operations *fop,
 		vm_private_data = vmap->vm_private_data;
 
 		rw_wlock(&linux_vma_lock);
-		TAILQ_FOREACH(ptr, &linux_vma_head, vm_entry) {
+		TAILQ_FOREACH(ptr, linux_vma_bucket(vm_private_data),
+		    vm_entry) {
 			if (ptr->vm_private_data == vm_private_data)
 				break;
 		}
@@ -1424,7 +1442,8 @@ linux_file_mmap_single(struct file *fp, const struct file_operations *fop,
 			}
 		} else {
 			/* insert VM area structure into list */
-			TAILQ_INSERT_TAIL(&linux_vma_head, vmap, vm_entry);
+			TAILQ_INSERT_TAIL(linux_vma_bucket(vm_private_data),
+			    vmap, vm_entry);
 			error = 0;
 			vm_no_fault = (vmap->vm_ops->fault == NULL);
 		}
@@ -2951,6 +2970,8 @@ linux_compat_init(void *arg)
 	}
 #endif
 	rw_init(&linux_vma_lock, "lkpi-vma-lock");
+	for (i = 0; i < LINUX_VMA_HASH_SIZE; i++)
+		TAILQ_INIT(&linux_vma_hash[i]);
 
 	rootoid = SYSCTL_ADD_ROOT_NODE(NULL,
 	    OID_AUTO, "sys", CTLFLAG_RD|CTLFLAG_MPSAFE, NULL, "sys");

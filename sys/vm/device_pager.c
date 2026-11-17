@@ -37,6 +37,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
+#include <sys/hash.h>
 #include <sys/lock.h>
 #include <sys/proc.h>
 #include <sys/mutex.h>
@@ -67,10 +68,24 @@ static void dev_pager_free_page(vm_object_t object, vm_page_t m);
 static int dev_pager_populate(vm_object_t object, vm_pindex_t pidx,
     int fault_type, vm_prot_t, vm_pindex_t *first, vm_pindex_t *last);
 
-/* list of device pager objects */
-static struct pagerlst dev_pager_object_list;
+/*
+ * Device pager objects, hashed by handle.  Every mmap of a device looks its
+ * handle up here, and a driver may keep many thousands of objects alive at
+ * once (a GPU driver's buffer objects), so a single list made each lookup
+ * walk them all.
+ */
+#define	DEV_PAGER_HASH_SIZE	1024	/* a power of 2 */
+static struct pagerlst dev_pager_object_hash[DEV_PAGER_HASH_SIZE];
 /* protect list manipulation */
 static struct mtx dev_pager_mtx;
+
+static struct pagerlst *
+dev_pager_object_list(void *handle)
+{
+
+	return (&dev_pager_object_hash[hash32_buf(&handle, sizeof(handle),
+	    HASHINIT) & (DEV_PAGER_HASH_SIZE - 1)]);
+}
 
 const struct pagerops devicepagerops = {
 	.pgo_kvme_type = KVME_TYPE_DEVICE,
@@ -110,7 +125,8 @@ static void
 dev_pager_init(void)
 {
 
-	TAILQ_INIT(&dev_pager_object_list);
+	for (int i = 0; i < DEV_PAGER_HASH_SIZE; i++)
+		TAILQ_INIT(&dev_pager_object_hash[i]);
 	mtx_init(&dev_pager_mtx, "dev_pager list", NULL, MTX_DEF);
 }
 
@@ -121,7 +137,7 @@ cdev_pager_lookup(void *handle)
 
 again:
 	mtx_lock(&dev_pager_mtx);
-	object = vm_pager_object_lookup(&dev_pager_object_list, handle);
+	object = vm_pager_object_lookup(dev_pager_object_list(handle), handle);
 	if (object != NULL && object->un_pager.devp.handle == NULL) {
 		msleep(&object->un_pager.devp.handle, &dev_pager_mtx,
 		    PVM | PDROP, "cdplkp", 0);
@@ -172,7 +188,7 @@ again:
 	/*
 	 * Look up pager, creating as necessary.
 	 */
-	object = vm_pager_object_lookup(&dev_pager_object_list, handle);
+	object = vm_pager_object_lookup(dev_pager_object_list(handle), handle);
 	if (object == NULL) {
 		vm_object_t object1;
 
@@ -184,7 +200,8 @@ again:
 		mtx_unlock(&dev_pager_mtx);
 		object1 = vm_object_allocate(tp, pindex);
 		mtx_lock(&dev_pager_mtx);
-		object = vm_pager_object_lookup(&dev_pager_object_list, handle);
+		object = vm_pager_object_lookup(dev_pager_object_list(handle),
+		    handle);
 		if (object != NULL) {
 			object1->type = OBJT_DEAD;
 			vm_object_deallocate(object1);
@@ -215,7 +232,7 @@ again:
 			object->un_pager.devp.ops = ops;
 			if (object->type == OBJT_DEVICE)
 				vm_object_set_flag(object, OBJ_PG_DTOR);
-			TAILQ_INSERT_TAIL(&dev_pager_object_list, object,
+			TAILQ_INSERT_TAIL(dev_pager_object_list(handle), object,
 			    pager_object_list);
 			mtx_unlock(&dev_pager_mtx);
 			if (ops->cdev_pg_populate != NULL)
@@ -223,8 +240,8 @@ again:
 			if (ops->cdev_pg_ctor(handle, size, prot, foff,
 			    cred, &color) != 0) {
 				mtx_lock(&dev_pager_mtx);
-				TAILQ_REMOVE(&dev_pager_object_list, object,
-				    pager_object_list);
+				TAILQ_REMOVE(dev_pager_object_list(handle),
+				    object, pager_object_list);
 				wakeup(&object->un_pager.devp.handle);
 				mtx_unlock(&dev_pager_mtx);
 				object->type = OBJT_DEAD;
@@ -336,7 +353,8 @@ dev_pager_dealloc(vm_object_t object)
 	object->un_pager.devp.ops->cdev_pg_dtor(object->un_pager.devp.handle);
 
 	mtx_lock(&dev_pager_mtx);
-	TAILQ_REMOVE(&dev_pager_object_list, object, pager_object_list);
+	TAILQ_REMOVE(dev_pager_object_list(object->handle), object,
+	    pager_object_list);
 	mtx_unlock(&dev_pager_mtx);
 	VM_OBJECT_WLOCK(object);
 
