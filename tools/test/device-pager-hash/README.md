@@ -33,12 +33,25 @@ At the peak, each lookup walks about 12,000 entries.
 | `cdev_pager_allocate`, per call | 308 µs | 35 µs |
 | `mmap(2)` by the GL client | 181 µs | 35 µs |
 | `munmap(2)` by the GL client | 36.7 µs | 4.4 µs |
-| timedemo, same light sampler running both times | 45.5–46.2 fps | 47.4–47.8 fps |
+| timedemo, untraced, mean of 3 runs | 46.0 fps | 48.3 fps |
 
 The "with the patch" column comes from a development kernel carrying the
 patch. Rebuilt with only this patch on the same base, the kernel measured
 1.46 µs per lookup and 1.34 µs per fault, and ran the timedemo at 47.6 fps
 traced and 48.0 fps untraced.
+
+Frame rate, three untraced timedemos back to back on each kernel, same
+session and settings (2,148 frames each):
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| stock | 45.4 fps (47.3 s) | 46.4 fps (46.3 s) | 46.3 fps (46.4 s) | 46.0 fps |
+| with the patch | 48.2 fps (44.6 s) | 48.0 fps (44.7 s) | 48.8 fps (44.0 s) | 48.3 fps |
+
+About 5% faster: the slowest patched run beats the fastest stock run. The
+walks were about 12% of busy kernel time (below), much of it overlapping
+with the game's own work, so the frame rate moves less than the per-call
+costs do. Programs that map buffers more heavily gain more (see mapload).
 
 ![Where busy kernel time goes, without the patch](charts/kernel-profile.svg)
 
